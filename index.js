@@ -136,13 +136,42 @@ const adapter = new (class DouYinAdapter {
     }
   }
 
-  // 资源直链 → 本机代理地址（附目标账号 uin 与可选 skey 供代理内解密）；
+  localMediaBase() {
+    return `http://localhost:${Bot.server?.address()?.port || 2536}`
+  }
+
+  // 资源直链 → 本机代理地址，供插件下载及渲染；发送文字时还原原始 CDN 链接。
   // 非 http(s)（data URI / base64 / 本地路径）原样返回；已是代理地址不二次包装
   resourceUrl(url, uin, skey) {
     if (typeof url !== "string" || !/^https?:\/\//i.test(url)) return url
-    if (url.includes(`${MEDIA_ROUTE}/`)) return url
-    const base = String(Bot.url || "http://localhost:2536").replace(/\/+$/, "")
+    if (url.includes(`${MEDIA_ROUTE}/`)) return this.mediaProxyAddress(url)
+    const base = this.localMediaBase()
     return `${base}${MEDIA_ROUTE}/${uin ?? ""}?u=${encodeURIComponent(url)}${skey ? `&k=${encodeURIComponent(skey)}` : ""}`
+  }
+
+  // 只转换本适配器的媒体地址，下载时用本机地址，对外文字提取原始 CDN 链接。
+  mediaProxyAddress(input, original = false) {
+    if (typeof input !== "string") return input
+    const local = this.localMediaBase()
+    try {
+      const url = new URL(input)
+      for (const base of [local, Bot.url]) {
+        if (!base) continue
+        const parsed = new URL(base)
+        const prefix = `${parsed.pathname.replace(/\/+$/, "")}${MEDIA_ROUTE}/`
+        if (url.origin !== parsed.origin || !url.pathname.startsWith(prefix)) continue
+        if (original) {
+          const source = url.searchParams.get("u")
+          return source && /^https?:\/\//i.test(source) ? source : input
+        }
+        return `${local}${MEDIA_ROUTE}/${url.pathname.slice(prefix.length)}${url.search}${url.hash}`
+      }
+    } catch {}
+    return input
+  }
+
+  originalMediaText(text) {
+    return text.replace(/https?:\/\/[^\s<>"'`\[\]]+/gi, url => this.mediaProxyAddress(url, true))
   }
 
   // 幂等挂载媒体代理路由：按账号 Cookie + Referer 拉取抖音私有资源；
@@ -195,10 +224,54 @@ const adapter = new (class DouYinAdapter {
     })
   }
 
+  // 同时提供 ICQQ 插件读取的 url 和发送侧使用的 file；记住资源以兼容 segment.image(url) 回传。
+  imageSegment(file, uin, resource) {
+    if (resource) {
+      this.imageResources ||= new Map()
+      const key = `${uin}:${file}`
+      this.imageResources.delete(key)
+      this.imageResources.set(key, resource)
+      if (this.imageResources.size > 1000) this.imageResources.delete(this.imageResources.keys().next().value)
+    }
+    return { type: "image", file, url: file, ...(resource ? { resource } : {}) }
+  }
+
   // 消息 → 消息段数组 + 日志用 raw_message：与 OPQBot/GSUIDCore 接收侧一致，组装 message 段时同步拼接
   // raw_message，每种消息类型带一个基本信息标记（如 [图片:url] / [视频:摘要] / [文件:名称] / [语音:摘要]），
   // 日志只打 raw_message，避免把带 resource 的自定义段整体序列化刷屏
   makeMessageSegs(msg, uin) {
+    // chat.history 返回 ChatMessage（msgId/msgType/content），并非推送的已解析消息体。
+    // 补齐取图需要的图片/表情/文本字段，让缓存过期后的引用仍可从历史恢复。
+    if (!msg.type) {
+      let body
+      try {
+        body = JSON.parse(msg.content)
+      } catch {}
+      const resource = body?.resource_url || body
+      const urls = key => {
+        const list = resource?.[key] ?? body?.[key]
+        return Array.isArray(list) ? list.filter(i => typeof i === "string") : []
+      }
+      const image = {
+        oid: String(resource?.oid ?? resource?.uri ?? ""),
+        skey: String(resource?.skey ?? ""),
+        md5: String(resource?.md5 ?? body?.md5 ?? ""),
+        dataSize: Number(resource?.data_size ?? body?.data_size ?? 0),
+        width: Number(body?.cover_width ?? resource?.width ?? 0),
+        height: Number(body?.cover_height ?? resource?.height ?? 0),
+        originUrls: urls("origin_url_list"),
+        largeUrls: urls("large_url_list"),
+        mediumUrls: urls("medium_url_list"),
+        thumbUrls: urls("thumb_url_list"),
+      }
+      const mediaType = [1, 2, 5, 7, 27].includes(msg.msgType)
+      const hasImage = mediaType &&
+        [image.originUrls, image.largeUrls, image.mediumUrls, image.thumbUrls].some(i => i.length)
+      const emoji = mediaType && (body?.url?.uri || body?.url?.url_list?.[0])
+      const text = String(body?.text ?? body?.content ?? body?.display_name ?? (body ? "" : msg.content || ""))
+      const type = hasImage ? "image" : emoji ? "emoji" : [1, 7].includes(msg.msgType) ? "text" : "unknown"
+      msg = { ...msg, type, image, emoji, text, raw: body ?? msg.content }
+    }
     const message = []
     let raw = ""
     for (const i of msg.ats || []) {
@@ -217,10 +290,10 @@ const adapter = new (class DouYinAdapter {
       case "image": {
         const url =
           msg.image.thumbUrls?.[0] || msg.image.mediumUrls?.[0] || msg.image.largeUrls?.[0] || msg.image.originUrls?.[0]
-        // 完整资源对象挂 resource 供发侧原样回传；私有图片（带 skey）展示用 file 走代理解密
+        // 完整资源对象挂 resource 供发侧原样回传；私有图片（带 skey）走代理解密
         if (url) {
           const file = msg.image.skey ? this.resourceUrl(url, uin, msg.image.skey) : url
-          message.push({ type: "image", file, resource: msg.image })
+          message.push(this.imageSegment(file, uin, msg.image))
           raw += `[图片:${file}]`
         }
         if (msg.text) {
@@ -240,7 +313,10 @@ const adapter = new (class DouYinAdapter {
           const coverUrl =
             video?.poster?.mediumUrls?.[0] || video?.poster?.thumbUrls?.[0] ||
             video?.poster?.largeUrls?.[0] || video?.poster?.originUrls?.[0]
-          if (coverUrl) message.push({ type: "image", file: video?.poster?.skey ? this.resourceUrl(coverUrl, uin, video.poster.skey) : coverUrl, resource: video?.poster })
+          if (coverUrl) {
+            const file = video?.poster?.skey ? this.resourceUrl(coverUrl, uin, video.poster.skey) : coverUrl
+            message.push(this.imageSegment(file, uin, video?.poster))
+          }
           else if (video?.inlinePic) message.push({ type: "image", file: `base64://${video.inlinePic}` })
           const playUrl = video?.url?.mainUrl
           message.push({ type: "text", text: playUrl ? `[视频] ${video?.skey ? this.resourceUrl(playUrl, uin, video.skey) : playUrl}` : "[视频]" })
@@ -278,14 +354,25 @@ const adapter = new (class DouYinAdapter {
           raw += msg.text
         }
         break
-      case "emoji":
-        if (msg.emoji) message.push({ type: "image", file: this.resourceUrl(msg.emoji, uin) })
+      case "emoji": {
+        // SDK 可能优先返回 uri（资源编号），真正可下载的签名链接仍在原始 content.url.url_list 中。
+        let url = msg.emoji
+        try {
+          const urls = JSON.parse(msg.content).url?.url_list
+          if (Array.isArray(urls)) url = urls.find(i => typeof i === "string" && /^https?:\/\//i.test(i)) || url
+        } catch {}
+        if (typeof url === "string" && /^https?:\/\//i.test(url)) {
+          message.push(this.imageSegment(this.resourceUrl(url, uin), uin))
+        } else {
+          message.push({ type: "text", text: msg.emoji ? `[表情:${msg.emoji}]` : "[表情]" })
+        }
         raw += msg.emoji ? `[表情:${msg.emoji}]` : "[表情]"
         if (msg.text) {
           message.push({ type: "text", text: msg.text })
           raw += msg.text
         }
         break
+      }
       case "location":
         if (msg.location) message.push({ type: "location", ...msg.location })
         raw += `[位置:${msg.location?.name || ""}]`
@@ -312,6 +399,8 @@ const adapter = new (class DouYinAdapter {
           raw += msg.text
         }
     }
+    if (msg.reference?.referencedMessageId)
+      message.unshift({ type: "reply", id: String(msg.reference.referencedMessageId) })
     return { message, raw }
   }
 
@@ -326,18 +415,18 @@ const adapter = new (class DouYinAdapter {
 
     const flush = () => {
       if (image) {
-        msgs.push({ type: "image", body: { type: "image", image, text }, reply })
-        text = ""
-        ats = []
+        // SDK 的图片接口忽略 text，文字必须另发，避免图链等内容只剩图片。
+        msgs.push({ type: "image", body: { type: "image", image }, reply })
         image = undefined
         reply = undefined
-      } else if (text || ats.length || atAll) {
+      }
+      if (text || ats.length || atAll) {
         // loader 的 at 选项会插入 "\n" 分隔段，SDK 提及追加在末尾，去掉多余换行
         msgs.push({
           type: "text",
           body: {
             type: "text",
-            text: ats.length || atAll ? text.replace(/^\n+/, "") : text,
+            text: this.originalMediaText(ats.length || atAll ? text.replace(/^\n+/, "") : text),
             ...(ats.length ? { ats } : {}),
             ...(atAll ? { atAll: true } : {}),
           },
@@ -350,7 +439,8 @@ const adapter = new (class DouYinAdapter {
       }
     }
 
-    for (const i of Array.isArray(msg) ? msg : [msg]) {
+    for (const item of Array.isArray(msg) ? msg : [msg]) {
+      const i = typeof item === "string" ? { type: "text", text: item } : item
       switch (i.type) {
         case "text":
           if (!i.text?.trim()) continue
@@ -372,7 +462,8 @@ const adapter = new (class DouYinAdapter {
         }
         case "image":
           flush()
-          image = await this.mediaSource(i.file, data.bot, true, i.resource)
+          image = await this.mediaSource(i.file || i.url, data.bot, true, i.resource)
+          if (typeof i.text === "string") text += i.text
           break
         case "record":
         case "file":
@@ -573,6 +664,11 @@ const adapter = new (class DouYinAdapter {
         throw new Error(`图片内容无效（${buf.length}B，无法识别图片格式），源数据可能损坏`)
       return new Uint8Array(buf)
     }
+    // 本适配器的媒体链接下载统一走本机代理。
+    if (typeof input === "string") input = this.mediaProxyAddress(input.trim().replace(/^`+|`+$/g, ""))
+    // 普通插件只回传图片 URL 时，在适配器内恢复资源对象，无需插件了解抖音私有字段。
+    if (img && !resource && typeof input === "string")
+      resource = this.imageResources?.get(`${bot?.uin}:${input.trim().replace(/^`+|`+$/g, "")}`)
     // 收侧 ImageResource 完整对象（oid/skey/md5 齐备）：SDK 服务端可直接引用原图资源，无需下载重传
     if (img && resource && ["oid", "skey", "md5"].every(k => typeof resource[k] === "string")) return resource
     if (Buffer.isBuffer(input) || input instanceof Uint8Array || input instanceof ArrayBuffer)
@@ -605,11 +701,16 @@ const adapter = new (class DouYinAdapter {
   // 发送单条消息体（reply 优先走引用回复），statusCode 非 0 抛错由调用方统一处理
   // 引用回复透传完整 body：SDK 0.6.7 起支持引用任意类型消息（图片/视频/文件等），@提及/@所有人随 body 一并生效
   async sendBody(data, { reply, body }) {
+    if (body.type === "text") body = { ...body, text: this.originalMediaText(body.text || "") }
     const ret = reply
       ? await data.bot.sdk.msg.reply(data.chatId, reply, body)
       : await data.bot.sdk.msg.send(data.chatId, body)
     Bot.makeLog("debug", ["发送消息返回", ret], data.self_id)
     if (ret.statusCode) throw new Error(`发送被拒：statusCode=${ret.statusCode} ${ret.statusMsg || ""}`)
+    // 实际日志：链接文字返回 OK + 消息 id，但附 checkCode=8101，收件方没有收到。
+    // 该校验码的语义尚未确认，不将这类响应当成已送达，也不自动重复发送。
+    if (Number(ret.checkCode) === 8101)
+      throw new Error(`消息未确认送达：checkCode=8101 statusCode=${ret.statusCode} ${ret.statusMsg || ""} message_id=${ret.serverMessageId || ""}`)
     return ret
   }
 
@@ -739,7 +840,7 @@ const adapter = new (class DouYinAdapter {
   async bodyImageSrc(bot, image) {
     try {
       if (typeof image === "string") {
-        if (/^https?:\/\//i.test(image)) return image
+        if (/^https?:\/\//i.test(image)) return this.mediaProxyAddress(image)
       } else if (
         image &&
         typeof image === "object" &&
@@ -748,7 +849,7 @@ const adapter = new (class DouYinAdapter {
         !(image instanceof ArrayBuffer)
       ) {
         const url = image.mediumUrls?.[0] || image.thumbUrls?.[0] || image.largeUrls?.[0] || image.originUrls?.[0] || image.url
-        return url && image.skey ? this.resourceUrl(url, bot?.uin, image.skey) : url || ""
+        return url && image.skey ? this.resourceUrl(url, bot?.uin, image.skey) : this.mediaProxyAddress(url || "")
       }
       const buf =
         Buffer.isBuffer(image) || image instanceof Uint8Array || image instanceof ArrayBuffer
@@ -909,12 +1010,29 @@ const adapter = new (class DouYinAdapter {
     return Bot.getMap(`${this.path}${id}/Member`)
   }
 
-  async getChatHistory(data, cnt = 20) {
-    const history = await data.bot.sdk.chat.history(data.chatId, { count: cnt })
+  async getChatHistory(data, anchorOrCount, count) {
+    // 保留原有 getChatHistory(count)，同时兼容 ICQQ 插件的 getChatHistory(seq/time, count)。
+    // loader 将抖音引用 id 放在 e.source.seq/time，因此这里按 id 精确定位。
+    const anchored = anchorOrCount != null && (count !== undefined || typeof anchorOrCount === "string")
+    const cnt = Math.max(1, Number(count ?? (anchored ? 20 : anchorOrCount)) || 20)
+    if (anchored) {
+      const target = await this.getMsg(data, anchorOrCount)
+      if (!target) return []
+      if (cnt === 1) return [target]
+      const cursor = Number(target.raw.indexInConversation)
+      if (!Number.isSafeInteger(cursor) || cursor <= 0) return [target]
+      const previous = await this.readChatHistory(data, cnt - 1, cursor)
+      return [...previous.filter(msg => msg.message_id !== target.message_id).reverse(), target].slice(-cnt)
+    }
+    return this.readChatHistory(data, cnt)
+  }
+
+  async readChatHistory(data, cnt, cursor) {
+    const history = await data.bot.sdk.chat.history(data.chatId, { count: cnt, ...(cursor != null ? { cursor } : {}) })
     return history.map(msg => {
       const { message, raw } = this.makeMessageSegs(msg, data.bot?.uin)
       return {
-        message_id: msg.serverMessageId,
+        message_id: msg.serverMessageId ?? msg.msgId,
         user_id: msg.senderUid,
         time: msg.createTime ? +msg.createTime / 1e6 : undefined,
         message,
@@ -922,6 +1040,25 @@ const adapter = new (class DouYinAdapter {
         raw: msg,
       }
     })
+  }
+
+  // 按引用 id 精确取消息：先查接收缓存，再查当前会话近期历史，避免把最新一条误当成引用。
+  async getMsg(data, message_id) {
+    if (message_id == null) return undefined
+    const id = String(message_id)
+    const cached = data.bot.replys[id]
+    if (cached?.chatId === data.chatId) {
+      const { message, raw } = this.makeMessageSegs(cached, data.bot.uin)
+      return {
+        message_id: cached.serverMessageId,
+        user_id: cached.senderUid,
+        time: cached.createTime ? +cached.createTime / 1e6 : undefined,
+        message,
+        raw_message: raw,
+        raw: cached,
+      }
+    }
+    return (await this.getChatHistory(data, 50)).find(msg => String(msg.message_id) === id)
   }
 
   pickFriend(id, user_id) {
@@ -973,7 +1110,8 @@ const adapter = new (class DouYinAdapter {
         }
         return { ...i, ...profile, user_id }
       },
-      getChatHistory: (cnt = 20) => this.getChatHistory(i, cnt),
+      getChatHistory: (anchorOrCount, count) => this.getChatHistory(i, anchorOrCount, count),
+      getMsg: message_id => this.getMsg(i, message_id),
     }
   }
 
@@ -1100,7 +1238,8 @@ const adapter = new (class DouYinAdapter {
         })
         return { ...i }
       },
-      getChatHistory: (cnt = 20) => this.getChatHistory(i, cnt),
+      getChatHistory: (anchorOrCount, count) => this.getChatHistory(i, anchorOrCount, count),
+      getMsg: message_id => this.getMsg(i, message_id),
       setGroupName: async group_name => {
         const ret = await i.bot.sdk.grp.rename(i.chatId, group_name)
         if (ret?.statusCode === 0) {
@@ -1245,7 +1384,7 @@ const adapter = new (class DouYinAdapter {
 
     const { message, raw: raw_message } = this.makeMessageSegs(msg, id)
     // 空内容消息（引用无正文 / 纯空文本）不构成有效消息，忽略避免空气泡
-    if (message.length === 0) {
+    if (message.every(i => i.type === "reply")) {
       Bot[id].stat.recv_msg_cnt--
       Bot.makeLog("debug", `空内容消息已忽略：[${msg.serverMessageId}] from=${msg.senderUid}`, id)
       return
